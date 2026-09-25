@@ -4,7 +4,7 @@
 
 set -u
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 ROOT="${REWIND_ROOT:-/opt}"
 OPKG="${REWIND_OPKG:-$ROOT/bin/opkg}"
 STATE_DIR="${REWIND_STATE_DIR:-$ROOT/var/lib/opkg-rewind}"
@@ -379,13 +379,55 @@ snapshot_all() {
     : > "$tx/snapshot.ready"
 }
 
+capture_after_manifests() {
+    tx="$1"
+    mkdir -p "$tx/after/pkg-lists" || return 1
+    while IFS='|' read -r op pkg || [ -n "${op:-}${pkg:-}" ]; do
+        [ -n "${pkg:-}" ] || continue
+        list="$INFO_DIR/$pkg.list"
+        if [ -r "$list" ]; then
+            cp -a "$list" "$tx/after/pkg-lists/$pkg.list" || return 1
+        fi
+    done < "$tx/plan"
+}
+
+pkg_was_installed_before() {
+    tx="$1" pkg="$2"
+    state="$(awk -F'|' -v p="$pkg" '$1 == p { print $2; exit }' "$tx/before/packages.state" 2>/dev/null)"
+    [ "$state" = "1" ]
+}
+
+remove_newly_installed_packages() {
+    tx="$1"
+    rev="$tx/plan.reverse"
+    awk '{ a[NR]=$0 } END { for (i=NR;i>=1;i--) print a[i] }' "$tx/plan" > "$rev" || return 1
+    : > "$tx/rollback-opkg.log"
+
+    while IFS='|' read -r op pkg || [ -n "${op:-}${pkg:-}" ]; do
+        [ -n "${pkg:-}" ] || continue
+        [ "$op" = "install" ] || continue
+        if pkg_was_installed_before "$tx" "$pkg"; then
+            continue
+        fi
+        if pkg_installed "$pkg"; then
+            info "Rollback uninstall: $pkg"
+            if ! "$OPKG" remove "$pkg" >> "$tx/rollback-opkg.log" 2>&1; then
+                warn "opkg remove failed for $pkg; continuing with manifest cleanup"
+            fi
+        fi
+    done < "$rev"
+    rm -f "$rev"
+    return 0
+}
+
 record_current_dirs_and_remove_new_files() {
     tx="$1"
     before="$tx/before"
     : > "$tx/rollback.dirs"
     while IFS='|' read -r op pkg || [ -n "${op:-}${pkg:-}" ]; do
         [ -n "${pkg:-}" ] || continue
-        list="$INFO_DIR/$pkg.list"
+        list="$tx/after/pkg-lists/$pkg.list"
+        [ -r "$list" ] || list="$INFO_DIR/$pkg.list"
         [ -r "$list" ] || continue
         while IFS= read -r p || [ -n "${p:-}" ]; do
             [ -n "$p" ] || continue
@@ -460,6 +502,8 @@ rollback_tx() {
     fi
 
     meta_set "$tx" state rolling_back || die "Cannot update rollback state"
+    info "Removing packages introduced by the transaction..."
+    remove_newly_installed_packages "$tx" || warn "Package-level rollback cleanup was incomplete; continuing with manifest cleanup"
     info "Removing files introduced by the transaction..."
     record_current_dirs_and_remove_new_files "$tx" || { meta_set "$tx" state rollback_failed; die "Rollback failed while removing new files"; }
     info "Restoring package-owned files..."
@@ -600,6 +644,9 @@ perform_transaction() {
     rc=$?
     cat "$tx/opkg.log"
     meta_set "$tx" opkg_exit "$rc"
+    if ! capture_after_manifests "$tx"; then
+        warn "Could not preserve all post-transaction package manifests"
+    fi
 
     if [ "$rc" -ne 0 ]; then
         meta_set "$tx" state failed
