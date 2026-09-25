@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2-1
+
+Transaction bookkeeping hardening from repeated real-device testing.
+
+- prevent snapshot-retention iteration from overwriting the active transaction ID
+- report the correct committed transaction ID after pruning
+- add a regression test that reaches three transactions and verifies the commit banner
+- make CI discover the built IPK dynamically instead of hard-coding a release filename
+
 ## 0.1.1-1
 
 Rollback hardening from the first real Keenetic/Entware device test.
