@@ -138,7 +138,7 @@ EOF2
                 fi
                 rm -f "$INFO/newpkg.list" "$INFO/newpkg.control"
                 awk -v p="newpkg" '
-                    BEGIN { RS=""; ORS="\n\n" }
+                    BEGIN { RS=""; FS="\n"; ORS="\n\n" }
                     {
                         keep=1
                         for (i=1;i<=NF;i++) if ($i == "Package: " p) keep=0
