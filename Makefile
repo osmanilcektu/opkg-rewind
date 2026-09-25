@@ -1,4 +1,4 @@
-VERSION ?= 0.1.0-1
+VERSION ?= 0.1.1-1
 BUILD := build
 PKGROOT := $(BUILD)/data
 CONTROL := $(BUILD)/control
