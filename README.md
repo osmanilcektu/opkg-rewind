@@ -98,10 +98,10 @@ These are also used by the included mock test suite.
 
 The current pre-release package is committed under `dist/` so it can be downloaded directly from the repository. Future tagged versions are also built and published automatically by GitHub Actions.
 
-Download `dist/opkg-rewind_0.1.2-1_all.ipk` to your computer, copy it to the router, then install it with the existing Entware `opkg`:
+Download `dist/opkg-rewind_0.1.3-1_all.ipk` to your computer, copy it to the router, then install it with the existing Entware `opkg`:
 
 ```sh
-opkg install /tmp/opkg-rewind_0.1.2-1_all.ipk
+opkg install /tmp/opkg-rewind_0.1.3-1_all.ipk
 rewind version
 rewind status
 rewind doctor --deep
@@ -112,3 +112,8 @@ The package itself does not fetch anything and does not install additional depen
 ## Release maturity
 
 `0.1.x` is a pre-release line. The transaction engine is covered by the included mock-opkg regression suite and BusyBox `ash` syntax validation, but real-device testing across Entware targets is still required before claiming broad production compatibility.
+
+
+### Drift baseline ordering
+
+Rewind determines package-DB drift against the most recent successful commit or rollback event, using transaction timestamps rather than transaction numbers. This matters when an older retained transaction is intentionally rolled back after newer transactions.
