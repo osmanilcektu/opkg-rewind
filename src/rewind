@@ -459,6 +459,38 @@ restore_files() {
     done < "$before/files.before"
 }
 
+verify_rollback_cleanup() {
+    tx="$1"
+    failures=0
+    while IFS='|' read -r op pkg || [ -n "${op:-}${pkg:-}" ]; do
+        [ -n "${pkg:-}" ] || continue
+        [ "$op" = "install" ] || continue
+        if pkg_was_installed_before "$tx" "$pkg"; then
+            continue
+        fi
+
+        if pkg_installed "$pkg"; then
+            warn "Rollback verification: newly introduced package is still installed: $pkg"
+            failures=$((failures + 1))
+        fi
+
+        list="$tx/after/pkg-lists/$pkg.list"
+        [ -r "$list" ] || continue
+        while IFS= read -r p || [ -n "${p:-}" ]; do
+            [ -n "$p" ] || continue
+            safe_owned_path "$p" || continue
+            if [ -d "$p" ] && [ ! -L "$p" ]; then
+                continue
+            fi
+            if [ -e "$p" ] || [ -L "$p" ]; then
+                warn "Rollback verification: introduced path still exists: $p ($pkg)"
+                failures=$((failures + 1))
+            fi
+        done < "$list"
+    done < "$tx/plan"
+    [ "$failures" -eq 0 ]
+}
+
 restore_metadata() {
     tx="$1"
     before="$tx/before"
@@ -512,15 +544,20 @@ rollback_tx() {
     restore_metadata "$tx" || { meta_set "$tx" state rollback_failed; die "Rollback failed while restoring opkg metadata"; }
     remove_empty_dirs "$tx/rollback.dirs"
 
-    if "$OPKG" list-installed >/dev/null 2>&1; then
-        meta_set "$tx" state rolled_back
-        meta_set "$tx" rolled_back_at "$(now_iso)"
-        [ "$CURRENT_TX" = "$tx" ] && CURRENT_TX=""
-        ok "Rollback completed"
-        return 0
+    if ! "$OPKG" list-installed >/dev/null 2>&1; then
+        meta_set "$tx" state rollback_failed
+        die "Files were restored, but opkg database validation failed"
     fi
-    meta_set "$tx" state rollback_failed
-    die "Files were restored, but opkg database validation failed"
+    if ! verify_rollback_cleanup "$tx"; then
+        meta_set "$tx" state rollback_failed
+        die "Rollback verification failed; one or more introduced package paths remain"
+    fi
+
+    meta_set "$tx" state rolled_back
+    meta_set "$tx" rolled_back_at "$(now_iso)"
+    [ "$CURRENT_TX" = "$tx" ] && CURRENT_TX=""
+    ok "Rollback completed"
+    return 0
 }
 
 health_check() {
