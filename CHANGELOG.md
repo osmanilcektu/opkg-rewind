@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3-1
+
+Drift-baseline correctness after out-of-order manual rollback.
+
+- choose the package-DB baseline from the most recent successful commit/rollback event
+- stop assuming the numerically newest transaction is always the latest system state
+- add a regression test matching the real-device sequence: newer remove rollback followed by rollback of an older install transaction
+
 ## 0.1.2-1
 
 Transaction bookkeeping hardening from repeated real-device testing.
