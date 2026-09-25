@@ -29,7 +29,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          IPK="build/opkg-rewind_0.1.1-1_all.ipk"
+          IPK="$(find build -maxdepth 1 -type f -name 'opkg-rewind_*_all.ipk' -print -quit)"
+          test -n "$IPK"
           test -s "$IPK"
           tar -tzf "$IPK" | grep -Fx './debian-binary'
           tar -tzf "$IPK" | grep -Fx './data.tar.gz'
