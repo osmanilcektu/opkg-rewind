@@ -189,7 +189,11 @@ assert_no_file "$ROOT/bin/demo-extra"
 # Simulate a package remove script that leaves the payload behind; Rewind's
 # preserved post-install manifest must still delete the orphan.
 write_demo_v1
-run_rewind install newpkg >/dev/null
+install_out="$(run_rewind install newpkg)"
+printf '%s\n' "$install_out" | grep -F '[+] Transaction 000003 committed' >/dev/null || {
+    echo "FAIL: committed transaction id was corrupted by internal loop state" >&2
+    exit 1
+}
 assert_file "$ROOT/bin/newpkg"
 FAKE_OPKG_REMOVE_LEAVES_FILE=1 run_rewind rollback >/dev/null
 assert_no_file "$ROOT/bin/newpkg"
