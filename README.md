@@ -72,7 +72,7 @@ Default policy retains only the three newest completed rollback snapshots and ca
 
 ## Rollback boundary
 
-Rewind restores package-owned files and the opkg package database/metadata captured before a transaction. It also removes newly introduced package-owned files where it can prove they were absent before the transaction.
+Rewind restores package-owned files and the opkg package database/metadata captured before a transaction. For packages introduced by a transaction, rollback first asks opkg to remove them in reverse dependency-plan order, then applies a preserved post-install file manifest to clean any package-owned payload that remains.
 
 It cannot make arbitrary package maintainer scripts fully transactional. A `postinst` script can, in principle, modify files outside the package's declared file list or change external state. Rewind therefore does not claim filesystem-level atomicity. On platforms with native filesystem snapshots, those remain stronger than package-file rollback.
 
@@ -98,10 +98,10 @@ These are also used by the included mock test suite.
 
 The current pre-release package is committed under `dist/` so it can be downloaded directly from the repository. Future tagged versions are also built and published automatically by GitHub Actions.
 
-Download `dist/opkg-rewind_0.1.0-1_all.ipk` to your computer, copy it to the router, then install it with the existing Entware `opkg`:
+Download `dist/opkg-rewind_0.1.1-1_all.ipk` to your computer, copy it to the router, then install it with the existing Entware `opkg`:
 
 ```sh
-opkg install /tmp/opkg-rewind_0.1.0-1_all.ipk
+opkg install /tmp/opkg-rewind_0.1.1-1_all.ipk
 rewind version
 rewind status
 rewind doctor --deep
