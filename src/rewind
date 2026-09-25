@@ -4,7 +4,7 @@
 
 set -u
 
-VERSION="0.1.2"
+VERSION="0.1.3"
 ROOT="${REWIND_ROOT:-/opt}"
 OPKG="${REWIND_OPKG:-$ROOT/bin/opkg}"
 STATE_DIR="${REWIND_STATE_DIR:-$ROOT/var/lib/opkg-rewind}"
@@ -756,15 +756,36 @@ latest_tx_id() {
 }
 
 latest_db_baseline() {
-    id="$(latest_tx_id)"
-    [ -n "$id" ] || return 2
-    tx="$TX_BASE/$id"
-    state="$(meta_get "$tx" state 2>/dev/null || printf 'unknown')"
-    case "$state" in
-        committed) [ -f "$tx/after/status" ] && { printf '%s\n' "$tx/after/status"; return 0; } ;;
-        rolled_back) [ -f "$tx/before/status" ] && { printf '%s\n' "$tx/before/status"; return 0; } ;;
-    esac
-    return 2
+    baseline_best_time=""
+    baseline_best_file=""
+    for baseline_id in $(ls -1 "$TX_BASE" 2>/dev/null | sort -r); do
+        baseline_tx="$TX_BASE/$baseline_id"
+        [ -d "$baseline_tx" ] || continue
+        baseline_state="$(meta_get "$baseline_tx" state 2>/dev/null || printf 'unknown')"
+        baseline_time=""
+        baseline_file=""
+        case "$baseline_state" in
+            committed)
+                baseline_time="$(meta_get "$baseline_tx" committed_at 2>/dev/null || true)"
+                baseline_file="$baseline_tx/after/status"
+                ;;
+            rolled_back)
+                baseline_time="$(meta_get "$baseline_tx" rolled_back_at 2>/dev/null || true)"
+                baseline_file="$baseline_tx/before/status"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        [ -n "$baseline_time" ] || continue
+        [ -f "$baseline_file" ] || continue
+        if [ -z "$baseline_best_time" ] || [ "$baseline_time" \> "$baseline_best_time" ]; then
+            baseline_best_time="$baseline_time"
+            baseline_best_file="$baseline_file"
+        fi
+    done
+    [ -n "$baseline_best_file" ] || return 2
+    printf '%s\n' "$baseline_best_file"
 }
 
 package_db_drift() {
