@@ -4,7 +4,7 @@
 
 set -u
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 ROOT="${REWIND_ROOT:-/opt}"
 OPKG="${REWIND_OPKG:-$ROOT/bin/opkg}"
 STATE_DIR="${REWIND_STATE_DIR:-$ROOT/var/lib/opkg-rewind}"
@@ -616,14 +616,14 @@ append_history() {
 
 prune_transactions() {
     [ "$KEEP_TRANSACTIONS" -gt 0 ] || return 0
-    count=0
-    for id in $(ls -1 "$TX_BASE" 2>/dev/null | sort -r); do
-        [ -d "$TX_BASE/$id" ] || continue
-        count=$((count + 1))
-        if [ "$count" -gt "$KEEP_TRANSACTIONS" ]; then
-            state="$(meta_get "$TX_BASE/$id" state 2>/dev/null || printf 'unknown')"
-            case "$state" in running|preparing|failed|health_failed|interrupted|rolling_back|rollback_failed) continue ;; esac
-            rm -rf "$TX_BASE/$id"
+    prune_count=0
+    for prune_id in $(ls -1 "$TX_BASE" 2>/dev/null | sort -r); do
+        [ -d "$TX_BASE/$prune_id" ] || continue
+        prune_count=$((prune_count + 1))
+        if [ "$prune_count" -gt "$KEEP_TRANSACTIONS" ]; then
+            prune_state="$(meta_get "$TX_BASE/$prune_id" state 2>/dev/null || printf 'unknown')"
+            case "$prune_state" in running|preparing|failed|health_failed|interrupted|rolling_back|rollback_failed) continue ;; esac
+            rm -rf "$TX_BASE/$prune_id"
         fi
     done
 }
@@ -650,20 +650,20 @@ perform_transaction() {
 
     preflight "$tmpplan" "$allow_core"
 
-    id="$(next_id)" || die "Cannot allocate transaction id"
-    tx="$TX_BASE/$id"
+    tx_id="$(next_id)" || die "Cannot allocate transaction id"
+    tx="$TX_BASE/$tx_id"
     mkdir -p "$tx" || die "Cannot create transaction directory"
     mv "$tmpplan" "$tx/plan"
     mv "$tmpraw" "$tx/plan.raw"
     CURRENT_TX="$tx"
-    meta_set "$tx" id "$id"
+    meta_set "$tx" id "$tx_id"
     meta_set "$tx" version "$VERSION"
     meta_set "$tx" state preparing
     meta_set "$tx" action "$action"
     meta_set "$tx" started_at "$(now_iso)"
     meta_set "$tx" args "$*"
 
-    info "Creating rollback snapshot for transaction $id..."
+    info "Creating rollback snapshot for transaction $tx_id..."
     snapshot_all "$tx" "$tx/plan"
     snap_rc=$?
     if [ "$snap_rc" -ne 0 ]; then
@@ -676,7 +676,7 @@ perform_transaction() {
 
     meta_set "$tx" state running
     meta_set "$tx" opkg_started_at "$(now_iso)"
-    info "Executing transaction $id..."
+    info "Executing transaction $tx_id..."
     "$OPKG" "$action" "$@" > "$tx/opkg.log" 2>&1
     rc=$?
     cat "$tx/opkg.log"
@@ -716,7 +716,7 @@ perform_transaction() {
     append_history "$tx"
     prune_transactions
     CURRENT_TX=""
-    ok "Transaction $id committed"
+    ok "Transaction $tx_id committed"
 }
 
 cmd_plan() {
