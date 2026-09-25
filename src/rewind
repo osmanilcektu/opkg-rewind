@@ -1,0 +1,976 @@
+#!/bin/sh
+# OPKG Rewind - zero-extra-package safety layer for Entware/opkg.
+# Runtime contract: POSIX /bin/sh + common BusyBox applets + existing opkg.
+
+set -u
+
+VERSION="0.1.0"
+ROOT="${REWIND_ROOT:-/opt}"
+OPKG="${REWIND_OPKG:-$ROOT/bin/opkg}"
+STATE_DIR="${REWIND_STATE_DIR:-$ROOT/var/lib/opkg-rewind}"
+TX_BASE="$STATE_DIR/transactions"
+LOCK_DIR="$STATE_DIR/lock"
+INFO_DIR="$ROOT/lib/opkg/info"
+STATUS_FILE="$ROOT/lib/opkg/status"
+CONF_FILE="${REWIND_CONFIG:-$ROOT/etc/opkg-rewind.conf}"
+TMP_DIR="$ROOT/tmp"
+HISTORY_FILE="$STATE_DIR/history.log"
+CURRENT_TX=""
+
+PATH="$ROOT/bin:$ROOT/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
+KEEP_TRANSACTIONS=3
+MAX_SNAPSHOT_KB=32768
+MIN_FREE_KB=8192
+AUTO_ROLLBACK=1
+ALLOW_CORE_DEFAULT=0
+
+say() { printf '%s\n' "$*"; }
+info() { printf '[i] %s\n' "$*"; }
+ok() { printf '[+] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+die() { printf '[x] %s\n' "$*" >&2; exit 1; }
+
+is_uint() {
+    case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
+load_config() {
+    [ -r "$CONF_FILE" ] || return 0
+    while IFS='=' read -r key val || [ -n "${key:-}${val:-}" ]; do
+        case "${key:-}" in
+            ''|'#'*) continue ;;
+            KEEP_TRANSACTIONS)
+                is_uint "$val" && KEEP_TRANSACTIONS="$val" || warn "Ignoring invalid KEEP_TRANSACTIONS"
+                ;;
+            MAX_SNAPSHOT_KB)
+                is_uint "$val" && MAX_SNAPSHOT_KB="$val" || warn "Ignoring invalid MAX_SNAPSHOT_KB"
+                ;;
+            MIN_FREE_KB)
+                is_uint "$val" && MIN_FREE_KB="$val" || warn "Ignoring invalid MIN_FREE_KB"
+                ;;
+            AUTO_ROLLBACK)
+                case "$val" in 0|1) AUTO_ROLLBACK="$val" ;; *) warn "Ignoring invalid AUTO_ROLLBACK" ;; esac
+                ;;
+            ALLOW_CORE_DEFAULT)
+                case "$val" in 0|1) ALLOW_CORE_DEFAULT="$val" ;; *) warn "Ignoring invalid ALLOW_CORE_DEFAULT" ;; esac
+                ;;
+        esac
+    done < "$CONF_FILE"
+}
+
+ensure_layout() {
+    mkdir -p "$STATE_DIR" "$TX_BASE" "$TMP_DIR" || die "Cannot create state directories"
+}
+
+opkg_ready() {
+    [ -x "$OPKG" ] || die "opkg not found or not executable: $OPKG"
+    [ -d "$ROOT" ] || die "Entware root does not exist: $ROOT"
+    [ -d "$INFO_DIR" ] || die "opkg info directory missing: $INFO_DIR"
+    [ -f "$STATUS_FILE" ] || die "opkg status database missing: $STATUS_FILE"
+}
+
+on_signal() {
+    code="$1"
+    if [ -n "${CURRENT_TX:-}" ] && [ -d "$CURRENT_TX" ]; then
+        meta_set "$CURRENT_TX" state interrupted 2>/dev/null || true
+        meta_set "$CURRENT_TX" interrupted_at "$(now_iso)" 2>/dev/null || true
+    fi
+    release_lock
+    exit "$code"
+}
+
+release_lock() {
+    [ -d "$LOCK_DIR" ] || return 0
+    if [ -r "$LOCK_DIR/pid" ]; then
+        owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+        [ "$owner" = "$$" ] || return 0
+    fi
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+}
+
+acquire_lock() {
+    ensure_layout
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        trap 'release_lock' EXIT
+        trap 'on_signal 129' HUP
+        trap 'on_signal 130' INT
+        trap 'on_signal 143' TERM
+        return 0
+    fi
+
+    owner=""
+    [ -r "$LOCK_DIR/pid" ] && owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if is_uint "$owner" && ! kill -0 "$owner" 2>/dev/null; then
+        warn "Removing stale OPKG Rewind lock (pid $owner)"
+        rm -rf "$LOCK_DIR" 2>/dev/null || die "Cannot remove stale lock"
+        mkdir "$LOCK_DIR" 2>/dev/null || die "Cannot acquire transaction lock"
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        trap 'release_lock' EXIT
+        trap 'on_signal 129' HUP
+        trap 'on_signal 130' INT
+        trap 'on_signal 143' TERM
+        return 0
+    fi
+    die "Another OPKG Rewind transaction is active${owner:+ (pid $owner)}"
+}
+
+validate_pkg() {
+    case "$1" in
+        ''|*[!A-Za-z0-9+_.-]*) die "Invalid package name: $1" ;;
+    esac
+}
+
+is_core_pkg() {
+    case "$1" in
+        opkg|opkg-rewind|entware-opt|entware-release|busybox|libc|libgcc|libpthread|librt|libstdcpp|ldconfig) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+now_iso() {
+    date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date
+}
+
+next_id() {
+    n=1
+    if [ -r "$STATE_DIR/next_id" ]; then
+        n="$(cat "$STATE_DIR/next_id" 2>/dev/null || printf '1')"
+        is_uint "$n" || n=1
+    fi
+    next=$((n + 1))
+    printf '%s\n' "$next" > "$STATE_DIR/next_id.tmp" || return 1
+    mv "$STATE_DIR/next_id.tmp" "$STATE_DIR/next_id" || return 1
+    printf '%06d' "$n"
+}
+
+meta_set() {
+    tx="$1" key="$2" value="$3"
+    tmp="$tx/meta.tmp"
+    if [ -f "$tx/meta" ]; then
+        awk -F= -v k="$key" '$1 != k { print $0 }' "$tx/meta" > "$tmp" || return 1
+    else
+        : > "$tmp" || return 1
+    fi
+    printf '%s=%s\n' "$key" "$value" >> "$tmp" || return 1
+    mv "$tmp" "$tx/meta"
+}
+
+meta_get() {
+    tx="$1" key="$2"
+    [ -r "$tx/meta" ] || return 1
+    awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$tx/meta"
+}
+
+pkg_field() {
+    pkg="$1" field="$2"
+    "$OPKG" status "$pkg" 2>/dev/null | awk -F': ' -v f="$field" '$1 == f { print $2; exit }'
+}
+
+pkg_installed() {
+    pkg="$1"
+    "$OPKG" status "$pkg" 2>/dev/null | awk '/^Status: / && $0 ~ / installed$/ { found=1 } END { exit(found ? 0 : 1) }'
+}
+
+free_kb() {
+    df -Pk "$ROOT" 2>/dev/null | awk 'NR > 1 { v=$4 } END { if (v ~ /^[0-9]+$/) print v; else print 0 }'
+}
+
+parse_plan() {
+    raw="$1" out="$2"
+    awk '
+        $1 == "Installing" && NF >= 2 { print "install|" $2 }
+        $1 == "Upgrading" && NF >= 2 { print "upgrade|" $2 }
+        $1 == "Downgrading" && $2 == "package" && NF >= 3 { print "downgrade|" $3 }
+        $1 == "Removing" && $2 == "package" && NF >= 3 { print "remove|" $3 }
+    ' "$raw" | awk -F'|' '!seen[$1 FS $2]++' > "$out"
+}
+
+run_plan() {
+    action="$1"; shift
+    raw="$1"; shift
+    plan="$1"; shift
+    "$OPKG" --noaction "$action" "$@" > "$raw" 2>&1
+    rc=$?
+    cat "$raw"
+    [ "$rc" -eq 0 ] || return "$rc"
+    parse_plan "$raw" "$plan"
+}
+
+plan_has_core_change() {
+    plan="$1"
+    while IFS='|' read -r op pkg || [ -n "${op:-}${pkg:-}" ]; do
+        [ -n "${pkg:-}" ] || continue
+        case "$op" in upgrade|downgrade|remove)
+            if is_core_pkg "$pkg"; then
+                printf '%s|%s\n' "$op" "$pkg"
+                return 0
+            fi
+            ;;
+        esac
+    done < "$plan"
+    return 1
+}
+
+estimate_snapshot_kb() {
+    plan="$1"
+    total=0
+    seen="$TMP_DIR/opkg-rewind-estimate.$$"
+    : > "$seen"
+    while IFS='|' read -r op pkg || [ -n "${op:-}${pkg:-}" ]; do
+        [ -n "${pkg:-}" ] || continue
+        if grep -Fx "$pkg" "$seen" >/dev/null 2>&1; then
+            continue
+        fi
+        printf '%s
+' "$pkg" >> "$seen"
+        if pkg_installed "$pkg"; then
+            # Entware/OpenWrt ipkg-build stores Installed-Size in bytes.
+            # Convert it to KiB because df -Pk and our limits are KiB-based.
+            sz="$(pkg_field "$pkg" 'Installed-Size')"
+            if ! is_uint "$sz" || [ "$sz" -eq 0 ]; then
+                control="$INFO_DIR/$pkg.control"
+                if [ -r "$control" ]; then
+                    sz="$(awk -F': ' '$1 == "Installed-Size" { print $2; exit }' "$control")"
+                fi
+            fi
+            is_uint "$sz" || sz=0
+            if [ "$sz" -gt 0 ]; then
+                kb=$(((sz + 1023) / 1024))
+                total=$((total + kb))
+            else
+                # Conservative minimum for custom packages without size metadata.
+                total=$((total + 64))
+            fi
+        fi
+    done < "$plan"
+    rm -f "$seen"
+    printf '%s
+' "$total"
+}
+
+path_kb() {
+    p="$1"
+    if [ -L "$p" ]; then
+        printf '1
+'
+        return 0
+    fi
+    kb="$(du -k "$p" 2>/dev/null | awk 'END { print $1 + 0 }')"
+    is_uint "$kb" || kb=1
+    [ "$kb" -gt 0 ] || kb=1
+    printf '%s
+' "$kb"
+}
+
+preflight() {
+    plan="$1" allow_core="$2"
+    opkg_ready
+    [ -w "$ROOT" ] || die "$ROOT is not writable"
+    [ -w "$INFO_DIR" ] || die "$INFO_DIR is not writable"
+
+    if [ "$allow_core" -ne 1 ]; then
+        core="$(plan_has_core_change "$plan" || true)"
+        [ -z "$core" ] || die "Core package change blocked: $core (use --allow-core only if you have external recovery access)"
+    fi
+
+    estimate="$(estimate_snapshot_kb "$plan")"
+    free="$(free_kb)"
+    required=$((estimate + MIN_FREE_KB))
+    info "Estimated rollback snapshot: ${estimate} KB"
+    info "Free space: ${free} KB; safety floor after snapshot: ${MIN_FREE_KB} KB"
+    [ "$estimate" -le "$MAX_SNAPSHOT_KB" ] || die "Snapshot estimate exceeds MAX_SNAPSHOT_KB=$MAX_SNAPSHOT_KB"
+    [ "$free" -ge "$required" ] || die "Insufficient free space for safe snapshot (need at least ${required} KB)"
+}
+
+safe_owned_path() {
+    p="$1"
+    case "$p" in
+        "$ROOT"|"$ROOT"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+snapshot_pkg() {
+    tx="$1" pkg="$2"
+    before="$tx/before"
+    mkdir -p "$before/info" "$before/files" "$before/pkg-lists" || return 1
+
+    installed=0
+    version="-"
+    if pkg_installed "$pkg"; then
+        installed=1
+        version="$(pkg_field "$pkg" 'Version')"
+        [ -n "$version" ] || version="unknown"
+    fi
+    printf '%s|%s|%s\n' "$pkg" "$installed" "$version" >> "$before/packages.state"
+
+    for f in "$INFO_DIR/$pkg".*; do
+        if [ -f "$f" ] || [ -L "$f" ]; then
+            cp -a "$f" "$before/info/" || return 1
+        fi
+    done
+
+    list="$INFO_DIR/$pkg.list"
+    [ -r "$list" ] || return 0
+    cp -a "$list" "$before/pkg-lists/$pkg.list" || return 1
+
+    while IFS= read -r p || [ -n "${p:-}" ]; do
+        [ -n "$p" ] || continue
+        if ! safe_owned_path "$p"; then
+            printf '%s|%s\n' "$pkg" "$p" >> "$before/skipped_external_paths"
+            continue
+        fi
+        if [ -d "$p" ] && [ ! -L "$p" ]; then
+            printf '%s\n' "$p" >> "$before/dirs.before"
+            continue
+        fi
+        if [ -e "$p" ] || [ -L "$p" ]; then
+            kb="$(path_kb "$p")"
+            next_kb=$((SNAPSHOT_USED_KB + kb))
+            if [ "$next_kb" -gt "$MAX_SNAPSHOT_KB" ]; then
+                warn "Snapshot cap would be exceeded by: $p"
+                return 3
+            fi
+            free="$(free_kb)"
+            required=$((kb + MIN_FREE_KB))
+            if [ "$free" -lt "$required" ]; then
+                warn "Insufficient free space to snapshot: $p"
+                return 2
+            fi
+            dest="$before/files$p"
+            mkdir -p "${dest%/*}" || return 1
+            cp -a "$p" "$dest" || return 1
+            SNAPSHOT_USED_KB="$next_kb"
+            printf '%s\n' "$p" >> "$before/files.before"
+        fi
+    done < "$list"
+}
+
+snapshot_all() {
+    tx="$1" plan="$2"
+    before="$tx/before"
+    SNAPSHOT_USED_KB=0
+    mkdir -p "$before" || return 1
+    cp -a "$STATUS_FILE" "$before/status" || return 1
+    : > "$before/packages.state"
+    : > "$before/files.before"
+    : > "$before/dirs.before"
+
+    seen="$tx/snapshot.seen"
+    : > "$seen"
+    while IFS='|' read -r op pkg || [ -n "${op:-}${pkg:-}" ]; do
+        [ -n "${pkg:-}" ] || continue
+        if grep -Fx "$pkg" "$seen" >/dev/null 2>&1; then
+            continue
+        fi
+        printf '%s\n' "$pkg" >> "$seen"
+        info "Snapshot: $pkg"
+        snapshot_pkg "$tx" "$pkg"
+        rc=$?
+        [ "$rc" -eq 0 ] || return "$rc"
+        free="$(free_kb)"
+        [ "$free" -ge "$MIN_FREE_KB" ] || return 2
+    done < "$plan"
+    rm -f "$seen"
+    meta_set "$tx" snapshot_kb "$SNAPSHOT_USED_KB" || true
+    : > "$tx/snapshot.ready"
+}
+
+record_current_dirs_and_remove_new_files() {
+    tx="$1"
+    before="$tx/before"
+    : > "$tx/rollback.dirs"
+    while IFS='|' read -r op pkg || [ -n "${op:-}${pkg:-}" ]; do
+        [ -n "${pkg:-}" ] || continue
+        list="$INFO_DIR/$pkg.list"
+        [ -r "$list" ] || continue
+        while IFS= read -r p || [ -n "${p:-}" ]; do
+            [ -n "$p" ] || continue
+            safe_owned_path "$p" || continue
+            if [ -d "$p" ] && [ ! -L "$p" ]; then
+                printf '%s\n' "$p" >> "$tx/rollback.dirs"
+                continue
+            fi
+            backup="$before/files$p"
+            if [ ! -e "$backup" ] && [ ! -L "$backup" ]; then
+                rm -f "$p" 2>/dev/null || return 1
+            fi
+        done < "$list"
+    done < "$tx/plan"
+}
+
+restore_files() {
+    tx="$1"
+    before="$tx/before"
+    [ -r "$before/files.before" ] || return 0
+    while IFS= read -r p || [ -n "${p:-}" ]; do
+        [ -n "$p" ] || continue
+        src="$before/files$p"
+        if [ -e "$src" ] || [ -L "$src" ]; then
+            mkdir -p "${p%/*}" || return 1
+            rm -f "$p" 2>/dev/null || return 1
+            cp -a "$src" "$p" || return 1
+        fi
+    done < "$before/files.before"
+}
+
+restore_metadata() {
+    tx="$1"
+    before="$tx/before"
+    while IFS='|' read -r op pkg || [ -n "${op:-}${pkg:-}" ]; do
+        [ -n "${pkg:-}" ] || continue
+        rm -f "$INFO_DIR/$pkg".* 2>/dev/null || return 1
+    done < "$tx/plan"
+
+    if [ -d "$before/info" ]; then
+        for f in "$before/info"/*; do
+            [ -f "$f" ] || [ -L "$f" ] || continue
+            cp -a "$f" "$INFO_DIR/" || return 1
+        done
+    fi
+
+    cp -a "$before/status" "$STATUS_FILE.rewind.tmp" || return 1
+    mv "$STATUS_FILE.rewind.tmp" "$STATUS_FILE" || return 1
+}
+
+remove_empty_dirs() {
+    file="$1"
+    [ -r "$file" ] || return 0
+    awk '{ a[NR]=$0 } END { for (i=NR;i>=1;i--) print a[i] }' "$file" |
+    while IFS= read -r d || [ -n "${d:-}" ]; do
+        [ -n "$d" ] || continue
+        safe_owned_path "$d" || continue
+        rmdir "$d" 2>/dev/null || true
+    done
+}
+
+rollback_tx() {
+    tx="$1" force="${2:-0}"
+    [ -d "$tx" ] || die "Transaction not found: $tx"
+    [ -f "$tx/snapshot.ready" ] || die "Transaction has no complete rollback snapshot"
+
+    state="$(meta_get "$tx" state 2>/dev/null || printf 'unknown')"
+    if [ "$state" = "committed" ] && [ "$force" -ne 1 ] && [ -f "$tx/after/status" ]; then
+        if ! cmp -s "$STATUS_FILE" "$tx/after/status" 2>/dev/null; then
+            die "Package database changed after this transaction; refusing stale rollback. Use --force only after inspection."
+        fi
+    fi
+
+    meta_set "$tx" state rolling_back || die "Cannot update rollback state"
+    info "Removing files introduced by the transaction..."
+    record_current_dirs_and_remove_new_files "$tx" || { meta_set "$tx" state rollback_failed; die "Rollback failed while removing new files"; }
+    info "Restoring package-owned files..."
+    restore_files "$tx" || { meta_set "$tx" state rollback_failed; die "Rollback failed while restoring files"; }
+    info "Restoring opkg metadata..."
+    restore_metadata "$tx" || { meta_set "$tx" state rollback_failed; die "Rollback failed while restoring opkg metadata"; }
+    remove_empty_dirs "$tx/rollback.dirs"
+
+    if "$OPKG" list-installed >/dev/null 2>&1; then
+        meta_set "$tx" state rolled_back
+        meta_set "$tx" rolled_back_at "$(now_iso)"
+        [ "$CURRENT_TX" = "$tx" ] && CURRENT_TX=""
+        ok "Rollback completed"
+        return 0
+    fi
+    meta_set "$tx" state rollback_failed
+    die "Files were restored, but opkg database validation failed"
+}
+
+health_check() {
+    tx="$1"
+    failures=0
+    [ -s "$STATUS_FILE" ] || { warn "Health: opkg status database is empty"; failures=$((failures + 1)); }
+    "$OPKG" list-installed >/dev/null 2>&1 || { warn "Health: opkg cannot read installed package database"; failures=$((failures + 1)); }
+
+    while IFS='|' read -r op pkg || [ -n "${op:-}${pkg:-}" ]; do
+        [ -n "${pkg:-}" ] || continue
+        case "$op" in
+            install|upgrade|downgrade)
+                if ! pkg_installed "$pkg"; then
+                    warn "Health: expected installed package missing: $pkg"
+                    failures=$((failures + 1))
+                    continue
+                fi
+                list="$INFO_DIR/$pkg.list"
+                if [ -r "$list" ]; then
+                    while IFS= read -r p || [ -n "${p:-}" ]; do
+                        [ -n "$p" ] || continue
+                        safe_owned_path "$p" || continue
+                        if [ ! -e "$p" ] && [ ! -L "$p" ]; then
+                            warn "Health: package-owned path missing: $p ($pkg)"
+                            failures=$((failures + 1))
+                            [ "$failures" -ge 20 ] && break
+                        fi
+                    done < "$list"
+                fi
+                ;;
+            remove)
+                if pkg_installed "$pkg"; then
+                    warn "Health: removed package still marked installed: $pkg"
+                    failures=$((failures + 1))
+                fi
+                ;;
+        esac
+        [ "$failures" -ge 20 ] && break
+    done < "$tx/plan"
+
+    [ "$failures" -eq 0 ]
+}
+
+append_history() {
+    tx="$1"
+    id="$(meta_get "$tx" id 2>/dev/null || printf '?')"
+    action="$(meta_get "$tx" action 2>/dev/null || printf '?')"
+    state="$(meta_get "$tx" state 2>/dev/null || printf '?')"
+    started="$(meta_get "$tx" started_at 2>/dev/null || printf '?')"
+    args="$(meta_get "$tx" args 2>/dev/null || printf '')"
+    printf '%s|%s|%s|%s|%s\n' "$id" "$started" "$action" "$state" "$args" >> "$HISTORY_FILE"
+    if [ -f "$HISTORY_FILE" ]; then
+        tail -n 100 "$HISTORY_FILE" > "$HISTORY_FILE.tmp" 2>/dev/null && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+    fi
+}
+
+prune_transactions() {
+    [ "$KEEP_TRANSACTIONS" -gt 0 ] || return 0
+    count=0
+    for id in $(ls -1 "$TX_BASE" 2>/dev/null | sort -r); do
+        [ -d "$TX_BASE/$id" ] || continue
+        count=$((count + 1))
+        if [ "$count" -gt "$KEEP_TRANSACTIONS" ]; then
+            state="$(meta_get "$TX_BASE/$id" state 2>/dev/null || printf 'unknown')"
+            case "$state" in running|preparing|failed|health_failed|interrupted|rolling_back|rollback_failed) continue ;; esac
+            rm -rf "$TX_BASE/$id"
+        fi
+    done
+}
+
+perform_transaction() {
+    action="$1" allow_core="$2" no_rollback="$3"; shift 3
+    [ "$#" -gt 0 ] || die "$action requires at least one package"
+    for pkg in "$@"; do validate_pkg "$pkg"; done
+
+    acquire_lock
+    opkg_ready
+
+    tmpraw="$TMP_DIR/opkg-rewind-plan.$$.raw"
+    tmpplan="$TMP_DIR/opkg-rewind-plan.$$.txt"
+    rm -f "$tmpraw" "$tmpplan"
+    info "Planning: opkg $action $*"
+    run_plan "$action" "$tmpraw" "$tmpplan" "$@" || { rc=$?; rm -f "$tmpraw" "$tmpplan"; die "opkg preflight simulation failed (exit $rc)"; }
+
+    if [ ! -s "$tmpplan" ]; then
+        rm -f "$tmpraw" "$tmpplan"
+        ok "No package changes are required"
+        return 0
+    fi
+
+    preflight "$tmpplan" "$allow_core"
+
+    id="$(next_id)" || die "Cannot allocate transaction id"
+    tx="$TX_BASE/$id"
+    mkdir -p "$tx" || die "Cannot create transaction directory"
+    mv "$tmpplan" "$tx/plan"
+    mv "$tmpraw" "$tx/plan.raw"
+    CURRENT_TX="$tx"
+    meta_set "$tx" id "$id"
+    meta_set "$tx" version "$VERSION"
+    meta_set "$tx" state preparing
+    meta_set "$tx" action "$action"
+    meta_set "$tx" started_at "$(now_iso)"
+    meta_set "$tx" args "$*"
+
+    info "Creating rollback snapshot for transaction $id..."
+    snapshot_all "$tx" "$tx/plan"
+    snap_rc=$?
+    if [ "$snap_rc" -ne 0 ]; then
+        meta_set "$tx" state snapshot_failed
+        [ "$snap_rc" -eq 2 ] && warn "Free space dropped below safety floor while snapshotting"
+        [ "$snap_rc" -eq 3 ] && warn "Snapshot exceeded MAX_SNAPSHOT_KB=$MAX_SNAPSHOT_KB"
+        append_history "$tx"
+        die "Snapshot failed; opkg was not executed"
+    fi
+
+    meta_set "$tx" state running
+    meta_set "$tx" opkg_started_at "$(now_iso)"
+    info "Executing transaction $id..."
+    "$OPKG" "$action" "$@" > "$tx/opkg.log" 2>&1
+    rc=$?
+    cat "$tx/opkg.log"
+    meta_set "$tx" opkg_exit "$rc"
+
+    if [ "$rc" -ne 0 ]; then
+        meta_set "$tx" state failed
+        warn "opkg exited with $rc"
+        if [ "$no_rollback" -eq 0 ] && [ "$AUTO_ROLLBACK" -eq 1 ]; then
+            warn "Automatic rollback starting..."
+            rollback_tx "$tx" 1
+        fi
+        append_history "$tx"
+        return "$rc"
+    fi
+
+    info "Running post-transaction health checks..."
+    if ! health_check "$tx"; then
+        meta_set "$tx" state health_failed
+        if [ "$no_rollback" -eq 0 ] && [ "$AUTO_ROLLBACK" -eq 1 ]; then
+            warn "Health check failed; automatic rollback starting..."
+            rollback_tx "$tx" 1
+            append_history "$tx"
+            return 2
+        fi
+        append_history "$tx"
+        die "Health check failed"
+    fi
+
+    mkdir -p "$tx/after"
+    cp -a "$STATUS_FILE" "$tx/after/status" || warn "Could not record post-transaction status fingerprint"
+    meta_set "$tx" state committed
+    meta_set "$tx" committed_at "$(now_iso)"
+    append_history "$tx"
+    prune_transactions
+    CURRENT_TX=""
+    ok "Transaction $id committed"
+}
+
+cmd_plan() {
+    [ "$#" -ge 2 ] || die "Usage: rewind plan <install|upgrade|remove> <package...>"
+    action="$1"; shift
+    case "$action" in install|upgrade|remove) ;; *) die "Unsupported plan action: $action" ;; esac
+    for pkg in "$@"; do validate_pkg "$pkg"; done
+    opkg_ready
+    raw="$TMP_DIR/opkg-rewind-plan.$$.raw"
+    plan="$TMP_DIR/opkg-rewind-plan.$$.txt"
+    run_plan "$action" "$raw" "$plan" "$@" || { rc=$?; rm -f "$raw" "$plan"; return "$rc"; }
+    say ""
+    say "OPKG Rewind plan"
+    say "----------------"
+    if [ -s "$plan" ]; then
+        while IFS='|' read -r op pkg; do printf '%-10s %s\n' "$op" "$pkg"; done < "$plan"
+        estimate="$(estimate_snapshot_kb "$plan")"
+        say ""
+        say "Estimated rollback snapshot: ${estimate} KB"
+        core="$(plan_has_core_change "$plan" || true)"
+        [ -z "$core" ] || say "Core-package protection would block: $core"
+    else
+        say "No changes required."
+    fi
+    rm -f "$raw" "$plan"
+}
+
+cmd_history() {
+    say "ID     DATE                         ACTION     STATE             PACKAGES"
+    say "------ ---------------------------- ---------- ----------------- ------------------------------"
+    [ -r "$HISTORY_FILE" ] || return 0
+    awk -F'|' '{ printf "%-6s %-28s %-10s %-17s %s\n", $1, $2, $3, $4, $5 }' "$HISTORY_FILE"
+}
+
+latest_tx_id() {
+    ls -1 "$TX_BASE" 2>/dev/null | sort -r | awk 'NR==1 { print; exit }'
+}
+
+latest_db_baseline() {
+    id="$(latest_tx_id)"
+    [ -n "$id" ] || return 2
+    tx="$TX_BASE/$id"
+    state="$(meta_get "$tx" state 2>/dev/null || printf 'unknown')"
+    case "$state" in
+        committed) [ -f "$tx/after/status" ] && { printf '%s\n' "$tx/after/status"; return 0; } ;;
+        rolled_back) [ -f "$tx/before/status" ] && { printf '%s\n' "$tx/before/status"; return 0; } ;;
+    esac
+    return 2
+}
+
+package_db_drift() {
+    baseline="$(latest_db_baseline 2>/dev/null)" || return 2
+    [ -r "$baseline" ] || return 2
+    cmp -s "$STATUS_FILE" "$baseline" 2>/dev/null && return 0
+    return 1
+}
+
+cmd_rollback() {
+    force=0
+    id=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --force) force=1 ;;
+            *) [ -z "$id" ] || die "Only one transaction id may be supplied"; id="$1" ;;
+        esac
+        shift
+    done
+    acquire_lock
+    opkg_ready
+    [ -n "$id" ] || id="$(latest_tx_id)"
+    [ -n "$id" ] || die "No transaction snapshots are available"
+    case "$id" in *[!0-9]*) die "Invalid transaction id: $id" ;; esac
+    tx="$TX_BASE/$id"
+    rollback_tx "$tx" "$force"
+    append_history "$tx"
+}
+
+cmd_recover() {
+    acquire_lock
+    opkg_ready
+    found=""
+    for id in $(ls -1 "$TX_BASE" 2>/dev/null | sort -r); do
+        tx="$TX_BASE/$id"
+        state="$(meta_get "$tx" state 2>/dev/null || printf 'unknown')"
+        case "$state" in
+            running|failed|health_failed|interrupted|rolling_back|rollback_failed|preparing)
+                if [ -f "$tx/snapshot.ready" ]; then found="$id"; break; fi
+                ;;
+        esac
+    done
+    [ -n "$found" ] || { ok "No interrupted transaction requires recovery"; return 0; }
+    warn "Recovering transaction $found"
+    rollback_tx "$TX_BASE/$found" 1
+    append_history "$TX_BASE/$found"
+}
+
+cmd_verify() {
+    opkg_ready
+    missing=0
+    checked=0
+    if [ "$#" -gt 0 ]; then
+        lists=""
+        for pkg in "$@"; do
+            validate_pkg "$pkg"
+            [ -r "$INFO_DIR/$pkg.list" ] || { warn "No installed file list for $pkg"; missing=$((missing + 1)); continue; }
+            lists="$lists $INFO_DIR/$pkg.list"
+        done
+    else
+        lists="$INFO_DIR"/*.list
+    fi
+
+    for list in $lists; do
+        [ -r "$list" ] || continue
+        pkg="${list##*/}"; pkg="${pkg%.list}"
+        while IFS= read -r p || [ -n "${p:-}" ]; do
+            [ -n "$p" ] || continue
+            safe_owned_path "$p" || continue
+            checked=$((checked + 1))
+            if [ ! -e "$p" ] && [ ! -L "$p" ]; then
+                printf 'MISSING  %s  (%s)\n' "$p" "$pkg"
+                missing=$((missing + 1))
+            fi
+        done < "$list"
+    done
+    say "Checked paths: $checked"
+    say "Missing paths: $missing"
+    [ "$missing" -eq 0 ]
+}
+
+cmd_doctor() {
+    deep=0
+    [ "${1:-}" = "--deep" ] && deep=1
+    problems=0
+    say "OPKG Rewind Doctor $VERSION"
+    say ""
+
+    if [ -x "$OPKG" ]; then ok "opkg executable: $OPKG"; else warn "opkg executable missing: $OPKG"; problems=$((problems + 1)); fi
+    if [ -d "$ROOT" ] && [ -w "$ROOT" ]; then ok "$ROOT is writable"; else warn "$ROOT is not writable"; problems=$((problems + 1)); fi
+    if [ -s "$STATUS_FILE" ]; then ok "package database present"; else warn "package database missing/empty"; problems=$((problems + 1)); fi
+    if "$OPKG" list-installed >/dev/null 2>&1; then ok "opkg database readable"; else warn "opkg database read failed"; problems=$((problems + 1)); fi
+
+    free="$(free_kb)"
+    if [ "$free" -ge "$MIN_FREE_KB" ]; then ok "free space: ${free} KB"; else warn "low free space: ${free} KB"; problems=$((problems + 1)); fi
+
+    if [ -d "$LOCK_DIR" ]; then
+        owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+        if is_uint "$owner" && kill -0 "$owner" 2>/dev/null; then
+            warn "active rewind lock: pid $owner"
+        else
+            warn "stale rewind lock detected"
+            problems=$((problems + 1))
+        fi
+    else
+        ok "no stale rewind lock"
+    fi
+
+    interrupted=0
+    for id in $(ls -1 "$TX_BASE" 2>/dev/null | sort -r); do
+        tx="$TX_BASE/$id"
+        state="$(meta_get "$tx" state 2>/dev/null || printf 'unknown')"
+        case "$state" in running|failed|health_failed|rolling_back|rollback_failed|preparing|interrupted)
+            warn "transaction $id requires inspection/recovery (state=$state)"
+            interrupted=$((interrupted + 1))
+            ;;
+        esac
+    done
+    [ "$interrupted" -eq 0 ] && ok "no interrupted transactions" || problems=$((problems + interrupted))
+
+    if package_db_drift; then
+        ok "package database matches latest Rewind baseline"
+    else
+        drift_rc=$?
+        if [ "$drift_rc" -eq 1 ]; then
+            warn "package database changed outside the latest completed Rewind transaction"
+            problems=$((problems + 1))
+        else
+            info "package database drift baseline unavailable"
+        fi
+    fi
+
+    if [ "$deep" -eq 1 ]; then
+        say ""
+        info "Deep file verification..."
+        cmd_verify || problems=$((problems + 1))
+    fi
+
+    say ""
+    if [ "$problems" -eq 0 ]; then
+        ok "Doctor found no problems"
+        return 0
+    fi
+    warn "Doctor found $problems problem(s)"
+    return 1
+}
+
+cmd_lock() {
+    opkg_ready
+    out="${1:-opkg.lock}"
+    tmp="$out.tmp.$$"
+    {
+        printf '# OPKG Rewind lock v1\n'
+        printf '# created=%s\n' "$(now_iso)"
+        "$OPKG" list-installed 2>/dev/null | awk '{ print $1 "|" $3 }' | sort
+    } > "$tmp" || { rm -f "$tmp"; die "Cannot create lock file"; }
+    mv "$tmp" "$out" || die "Cannot write $out"
+    ok "Lock file written: $out"
+}
+
+cmd_lock_check() {
+    [ "$#" -eq 1 ] || die "Usage: rewind lock-check <opkg.lock>"
+    lock="$1"
+    [ -r "$lock" ] || die "Cannot read lock file: $lock"
+    opkg_ready
+    cur="$TMP_DIR/opkg-rewind-current.$$"
+    "$OPKG" list-installed 2>/dev/null | awk '{ print $1 "|" $3 }' | sort > "$cur"
+    wanted="$TMP_DIR/opkg-rewind-wanted.$$"
+    awk '!/^#/ && NF { print }' "$lock" | sort > "$wanted"
+    if cmp -s "$cur" "$wanted"; then
+        rm -f "$cur" "$wanted"
+        ok "Installed package set matches lock file"
+        return 0
+    fi
+    say "Package set differs from lock file:"
+    awk -F'|' '
+        NR==FNR { want[$1]=$2; next }
+        { cur[$1]=$2 }
+        END {
+            for (p in want) {
+                if (!(p in cur)) print "MISSING  " p "  wanted=" want[p]
+                else if (cur[p] != want[p]) print "VERSION  " p "  current=" cur[p] " wanted=" want[p]
+            }
+            for (p in cur) if (!(p in want)) print "EXTRA    " p "  current=" cur[p]
+        }
+    ' "$wanted" "$cur" | sort
+    rm -f "$cur" "$wanted"
+    return 2
+}
+
+cmd_status() {
+    ensure_layout
+    say "OPKG Rewind $VERSION"
+    say "Root: $ROOT"
+    say "State: $STATE_DIR"
+    say "Snapshots kept: $KEEP_TRANSACTIONS"
+    say "Snapshot cap: ${MAX_SNAPSHOT_KB} KB"
+    say "Free-space floor: ${MIN_FREE_KB} KB"
+    latest="$(latest_tx_id)"
+    if [ -n "$latest" ]; then
+        state="$(meta_get "$TX_BASE/$latest" state 2>/dev/null || printf 'unknown')"
+        say "Latest transaction: $latest ($state)"
+        if package_db_drift; then
+            say "Package DB drift: no"
+        else
+            drift_rc=$?
+            if [ "$drift_rc" -eq 1 ]; then
+                say "Package DB drift: YES (changed outside latest completed Rewind transaction)"
+            else
+                say "Package DB drift: unknown (no completed baseline)"
+            fi
+        fi
+    else
+        say "Latest transaction: none"
+        say "Package DB drift: unknown (no Rewind baseline yet)"
+    fi
+}
+
+cmd_update() {
+    acquire_lock
+    opkg_ready
+    "$OPKG" update
+}
+
+usage() {
+    cat <<EOF2
+OPKG Rewind $VERSION
+Zero-extra-package transaction safety layer for Entware/opkg.
+
+Usage:
+  rewind status
+  rewind doctor [--deep]
+  rewind plan <install|upgrade|remove> <package...>
+  rewind install [--allow-core] [--no-rollback] <package...>
+  rewind upgrade [--allow-core] [--no-rollback] <package...>
+  rewind remove  [--allow-core] [--no-rollback] <package...>
+  rewind rollback [--force] [transaction-id]
+  rewind recover
+  rewind history
+  rewind verify [package...]
+  rewind lock [file]
+  rewind lock-check <file>
+  rewind update
+  rewind version
+
+Safety defaults:
+  - Runs opkg --noaction before every mutating transaction.
+  - Blocks core package upgrade/removal unless --allow-core is explicit.
+  - Snapshots package-owned files and opkg metadata before changes.
+  - Rolls back automatically on opkg failure or health-check failure.
+  - Refuses stale manual rollback when the package DB changed afterwards.
+  - Runs no daemon and performs no background polling.
+EOF2
+}
+
+load_config
+
+cmd="${1:-help}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+    help|-h|--help) usage ;;
+    version|--version|-V) say "$VERSION" ;;
+    status) cmd_status "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    plan) cmd_plan "$@" ;;
+    history) cmd_history ;;
+    rollback) cmd_rollback "$@" ;;
+    recover) cmd_recover ;;
+    verify) cmd_verify "$@" ;;
+    lock) cmd_lock "$@" ;;
+    lock-check) cmd_lock_check "$@" ;;
+    update) cmd_update ;;
+    install|upgrade|remove)
+        allow_core="$ALLOW_CORE_DEFAULT"
+        no_rollback=0
+        pkgs=""
+        # Package names cannot contain spaces, so a simple rebuilt argv is safe here.
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --allow-core) allow_core=1 ;;
+                --no-rollback) no_rollback=1 ;;
+                --*) die "Unknown option: $1" ;;
+                *) validate_pkg "$1"; pkgs="$pkgs $1" ;;
+            esac
+            shift
+        done
+        [ -n "$pkgs" ] || die "$cmd requires at least one package"
+        # shellcheck disable=SC2086
+        perform_transaction "$cmd" "$allow_core" "$no_rollback" $pkgs
+        ;;
+    *) die "Unknown command: $cmd (run: rewind help)" ;;
+esac
