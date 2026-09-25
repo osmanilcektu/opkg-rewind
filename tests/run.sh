@@ -67,6 +67,10 @@ if [ "${1:-}" = "--noaction" ]; then
             echo "Removing package demo from root..."
             exit 0
             ;;
+        remove:newpkg)
+            echo "Removing package newpkg from root..."
+            exit 0
+            ;;
     esac
     exit 0
 fi
@@ -225,7 +229,19 @@ fi
 printf 'old\n' > "$ROOT/bin/demo"
 chmod 755 "$ROOT/bin/demo"
 
-# 8) Direct/out-of-band package DB changes must be reported as drift.
+# 8) Rolling back an older retained transaction after a newer one must become
+# the latest drift baseline by event time, not by transaction number.
+write_demo_v1
+run_rewind install newpkg >/dev/null
+run_rewind remove newpkg >/dev/null
+run_rewind rollback >/dev/null
+run_rewind rollback 000004 >/dev/null
+if ! run_rewind status | grep -F 'Package DB drift: no' >/dev/null; then
+    echo "FAIL: chronological baseline selection failed after older transaction rollback" >&2
+    exit 1
+fi
+
+# 9) Direct/out-of-band package DB changes must be reported as drift.
 cat >> "$ROOT/lib/opkg/status" <<'EOS'
 Package: outside
 Version: 1.0
