@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install BusyBox for ash syntax validation
+        run: sudo apt-get update && sudo apt-get install -y busybox
+      - name: Test and build
+        run: make all
+      - name: Prepare release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp build/opkg-rewind_*_all.ipk release/
+          (cd release && sha256sum opkg-rewind_*_all.ipk > SHA256SUMS)
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" release/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "OPKG Rewind ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --prerelease

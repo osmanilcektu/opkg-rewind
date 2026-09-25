@@ -1,0 +1,11 @@
+Package: opkg-rewind
+Version: 0.1.0-1
+Architecture: all
+Installed-Size: 0
+Maintainer: OPKG Rewind Project
+Section: utils
+Priority: optional
+License: GPL-3.0-or-later
+Description: Zero-extra-package transaction safety and rollback wrapper for Entware opkg.
+ Provides simulation-first package changes, bounded package-file snapshots, automatic rollback,
+ health checks, transaction history, recovery, verification, and package-set lock auditing.
