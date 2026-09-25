@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install BusyBox for ash syntax validation
+        run: sudo apt-get update && sudo apt-get install -y busybox
+
+      - name: Test
+        run: make test
+
+      - name: Build IPK
+        run: make ipk
+
+      - name: Verify package structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          IPK="build/opkg-rewind_0.1.0-1_all.ipk"
+          test -s "$IPK"
+          tar -tzf "$IPK" | grep -Fx './debian-binary'
+          tar -tzf "$IPK" | grep -Fx './data.tar.gz'
+          tar -tzf "$IPK" | grep -Fx './control.tar.gz'
+          sha256sum "$IPK"
