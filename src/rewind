@@ -146,6 +146,24 @@ next_id() {
     printf '%06d' "$n"
 }
 
+next_event_seq() {
+    event_n=1
+    if [ -r "$STATE_DIR/next_event_seq" ]; then
+        event_n="$(cat "$STATE_DIR/next_event_seq" 2>/dev/null || printf '1')"
+        is_uint "$event_n" || event_n=1
+    fi
+    event_next=$((event_n + 1))
+    printf '%s\n' "$event_next" > "$STATE_DIR/next_event_seq.tmp" || return 1
+    mv "$STATE_DIR/next_event_seq.tmp" "$STATE_DIR/next_event_seq" || return 1
+    printf '%s\n' "$event_n"
+}
+
+record_event_seq() {
+    event_tx="$1"
+    event_seq="$(next_event_seq)" || return 1
+    meta_set "$event_tx" event_seq "$event_seq"
+}
+
 meta_set() {
     tx="$1" key="$2" value="$3"
     tmp="$tx/meta.tmp"
@@ -555,6 +573,7 @@ rollback_tx() {
 
     meta_set "$tx" state rolled_back
     meta_set "$tx" rolled_back_at "$(now_iso)"
+    record_event_seq "$tx" || warn "Could not record rollback event sequence"
     [ "$CURRENT_TX" = "$tx" ] && CURRENT_TX=""
     ok "Rollback completed"
     return 0
@@ -713,6 +732,7 @@ perform_transaction() {
     cp -a "$STATUS_FILE" "$tx/after/status" || warn "Could not record post-transaction status fingerprint"
     meta_set "$tx" state committed
     meta_set "$tx" committed_at "$(now_iso)"
+    record_event_seq "$tx" || warn "Could not record commit event sequence"
     append_history "$tx"
     prune_transactions
     CURRENT_TX=""
@@ -756,8 +776,11 @@ latest_tx_id() {
 }
 
 latest_db_baseline() {
+    baseline_best_seq=0
+    baseline_best_seq_file=""
     baseline_best_time=""
-    baseline_best_file=""
+    baseline_best_time_file=""
+
     for baseline_id in $(ls -1 "$TX_BASE" 2>/dev/null | sort -r); do
         baseline_tx="$TX_BASE/$baseline_id"
         [ -d "$baseline_tx" ] || continue
@@ -777,15 +800,30 @@ latest_db_baseline() {
                 continue
                 ;;
         esac
-        [ -n "$baseline_time" ] || continue
         [ -f "$baseline_file" ] || continue
-        if [ -z "$baseline_best_time" ] || [ "$baseline_time" \> "$baseline_best_time" ]; then
+
+        baseline_seq="$(meta_get "$baseline_tx" event_seq 2>/dev/null || true)"
+        if is_uint "$baseline_seq"; then
+            if [ "$baseline_seq" -gt "$baseline_best_seq" ]; then
+                baseline_best_seq="$baseline_seq"
+                baseline_best_seq_file="$baseline_file"
+            fi
+            continue
+        fi
+
+        [ -n "$baseline_time" ] || continue
+        if [ -z "$baseline_best_time" ] || awk -v a="$baseline_time" -v b="$baseline_best_time" 'BEGIN { exit !(a > b) }'; then
             baseline_best_time="$baseline_time"
-            baseline_best_file="$baseline_file"
+            baseline_best_time_file="$baseline_file"
         fi
     done
-    [ -n "$baseline_best_file" ] || return 2
-    printf '%s\n' "$baseline_best_file"
+
+    if [ -n "$baseline_best_seq_file" ]; then
+        printf '%s\n' "$baseline_best_seq_file"
+        return 0
+    fi
+    [ -n "$baseline_best_time_file" ] || return 2
+    printf '%s\n' "$baseline_best_time_file"
 }
 
 package_db_drift() {
