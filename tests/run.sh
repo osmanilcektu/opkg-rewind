@@ -123,9 +123,28 @@ EOF2
         ;;
     remove)
         pkg="$2"
-        [ "$pkg" = demo ] || exit 1
-        rm -f "$ROOT/bin/demo" "$INFO/demo.list" "$INFO/demo.control"
-        : > "$STATUS"
+        case "$pkg" in
+            demo)
+                rm -f "$ROOT/bin/demo" "$INFO/demo.list" "$INFO/demo.control"
+                : > "$STATUS"
+                ;;
+            newpkg)
+                if [ "${FAKE_OPKG_REMOVE_LEAVES_FILE:-0}" != 1 ]; then
+                    rm -f "$ROOT/bin/newpkg"
+                fi
+                rm -f "$INFO/newpkg.list" "$INFO/newpkg.control"
+                awk -v p="newpkg" '
+                    BEGIN { RS=""; ORS="\n\n" }
+                    {
+                        keep=1
+                        for (i=1;i<=NF;i++) if ($i == "Package: " p) keep=0
+                        if (keep) print $0
+                    }
+                ' "$STATUS" > "$STATUS.tmp"
+                mv "$STATUS.tmp" "$STATUS"
+                ;;
+            *) exit 1 ;;
+        esac
         ;;
     *) exit 1 ;;
 esac
@@ -167,11 +186,14 @@ assert_eq "old" "$(cat "$ROOT/bin/demo")" "manual rollback content"
 assert_no_file "$ROOT/bin/demo-extra"
 
 # 3) New package install followed by rollback removes it cleanly.
+# Simulate a package remove script that leaves the payload behind; Rewind's
+# preserved post-install manifest must still delete the orphan.
 write_demo_v1
 run_rewind install newpkg >/dev/null
 assert_file "$ROOT/bin/newpkg"
-run_rewind rollback >/dev/null
+FAKE_OPKG_REMOVE_LEAVES_FILE=1 run_rewind rollback >/dev/null
 assert_no_file "$ROOT/bin/newpkg"
+assert_no_file "$ROOT/lib/opkg/info/newpkg.list"
 
 # 4) Deep verify should pass on known-good state.
 run_rewind doctor --deep >/dev/null
