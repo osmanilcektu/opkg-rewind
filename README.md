@@ -98,10 +98,10 @@ These are also used by the included mock test suite.
 
 The current pre-release package is committed under `dist/` so it can be downloaded directly from the repository. Future tagged versions are also built and published automatically by GitHub Actions.
 
-Download `dist/opkg-rewind_0.1.1-1_all.ipk` to your computer, copy it to the router, then install it with the existing Entware `opkg`:
+Download `dist/opkg-rewind_0.1.2-1_all.ipk` to your computer, copy it to the router, then install it with the existing Entware `opkg`:
 
 ```sh
-opkg install /tmp/opkg-rewind_0.1.1-1_all.ipk
+opkg install /tmp/opkg-rewind_0.1.2-1_all.ipk
 rewind version
 rewind status
 rewind doctor --deep
